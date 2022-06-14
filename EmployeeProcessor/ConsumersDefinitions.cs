@@ -17,7 +17,8 @@ namespace EmployeeProcessor.Consumers
     //    protected override void ConfigureConsumer(
     //        IReceiveEndpointConfigurator endpointConfigurator, IConsumerConfigurator<AddEmployeeConsumer> consumerConfigurator)
     //    {
-    //        ConcurrentMessageLimit = 1;
+    //        ConcurrentMessageLimit = 8;
+    //        endpointConfigurator.UseRetry
     //    }
     //}
 

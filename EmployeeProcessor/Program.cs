@@ -1,10 +1,15 @@
 ﻿using System;
+using System.Diagnostics;
 using System.Reflection;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.DependencyInjection;
 using MassTransit;
 using Serilog;
 using Serilog.Events;
+using OpenTelemetry;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
 using Contracts;
 
 namespace EmployeeProcessor
@@ -18,46 +23,72 @@ namespace EmployeeProcessor
 
         public static IHostBuilder CreateHostBuilder(string[] args) =>
             Host.CreateDefaultBuilder(args)
-                .UseSerilog((host, log) =>
-                {
-                    if (host.HostingEnvironment.IsProduction())
-                        log.MinimumLevel.Information();
-                    else
-                        log.MinimumLevel.Debug();
+                             .UseSerilog((host, log) =>
+                             {
+                                 if (host.HostingEnvironment.IsProduction())
+                                     log.MinimumLevel.Information();
+                                 else
+                                     log.MinimumLevel.Information();
 
-                    log.MinimumLevel.Override("Microsoft", LogEventLevel.Warning);
-                    log.MinimumLevel.Override("Quartz", LogEventLevel.Information);
-                    log.WriteTo.Console();
-                })
+                                 log.MinimumLevel.Override("Microsoft", LogEventLevel.Information);
+                                 log.MinimumLevel.Override("Quartz", LogEventLevel.Information);
+                                 log.WriteTo.Console();
+                             })
                 .ConfigureServices((hostContext, services) =>
                 {
-                    services.AddMassTransit(x =>
+                    services.AddMassTransit(config =>
                     {
-                        // By default, sagas are in-memory, but should be changed to a durable
-                        // saga repository.
-                        x.SetInMemorySagaRepositoryProvider();
-
                         var entryAssembly = Assembly.GetEntryAssembly();
 
-                        x.AddConsumers(entryAssembly);
-                        x.AddSagaStateMachines(entryAssembly);
-                        x.AddSagas(entryAssembly);
-                        x.AddActivities(entryAssembly);
+                        config.AddConsumers(entryAssembly);
+                        config.AddSagaStateMachines(entryAssembly);
+                        config.AddSagas(entryAssembly);
+                        config.AddActivities(entryAssembly);
 
-                        x.UsingRabbitMq((context, cfg) =>
+                        config.UsingRabbitMq((context, mqConfig) =>
                         {
-                            cfg.Host("localhost", "employees", h =>
+                            mqConfig.Host("localhost", "employees", h =>
                             {
                                 h.Username("guest");
                                 h.Password("guest");
                             });
 
-                            //cfg.UseDelayedRedelivery(r => r.Intervals(TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(30)));
-                            //cfg.UseMessageRetry(r => r.Immediate(5));
-                            //cfg.UseInMemoryOutbox();
+                            mqConfig.PrefetchCount = 2;
+                            mqConfig.UseMessageRetry(r => r.Interval(5, 1000));
+                            mqConfig.UseInMemoryOutbox();
 
-                            cfg.ConfigureEndpoints(context);
+                            mqConfig.ConfigureEndpoints(context);
                         });
+                    });
+
+                    services.AddOptions<MassTransitHostOptions>()
+                        .Configure(config =>
+                        {
+                            config.WaitUntilStarted = true;
+                        });
+
+                    services.AddOpenTelemetryTracing(builder =>
+                    {
+                        builder.SetResourceBuilder(ResourceBuilder.CreateDefault()
+                                .AddService("Publisher")
+                                .AddTelemetrySdk()
+                                .AddEnvironmentVariableDetector())
+                            .AddSource("MassTransit")
+                            .AddAspNetCoreInstrumentation()
+                            .AddJaegerExporter(o =>
+                            {
+                                o.AgentHost = "localhost";
+                                o.AgentPort = 6831;
+                                o.MaxPayloadSizeInBytes = 4096;
+                                o.ExportProcessorType = ExportProcessorType.Batch;
+                                o.BatchExportProcessorOptions = new BatchExportProcessorOptions<Activity>
+                                {
+                                    MaxQueueSize = 2048,
+                                    ScheduledDelayMilliseconds = 5000,
+                                    ExporterTimeoutMilliseconds = 30000,
+                                    MaxExportBatchSize = 512,
+                                };
+                            });
                     });
 
                     BrokerMapping.MapEntities();

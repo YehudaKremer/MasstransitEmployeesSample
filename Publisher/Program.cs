@@ -1,14 +1,17 @@
 using System;
+using System.Diagnostics;
 using System.Reflection;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Hosting;
-using MassTransit;
 using Microsoft.Extensions.DependencyInjection;
+using MassTransit;
 using Serilog;
 using Serilog.Events;
+using OpenTelemetry;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
+
 using Contracts;
-using System.Data;
-using Microsoft.Data.SqlClient;
 
 namespace Publisher
 {
@@ -36,31 +39,61 @@ namespace Publisher
                 })
                 .ConfigureServices((hostContext, services) =>
                 {
-                    services.AddMassTransit(x =>
+                    services.AddMassTransit(config =>
                     {
-                        x.SetDapperSagaRepositoryProvider(SagaConnectionstring, config => { });
+                        config.SetDapperSagaRepositoryProvider(SagaConnectionstring, config => { });
 
                         var entryAssembly = Assembly.GetEntryAssembly();
 
-                        x.AddConsumers(entryAssembly);
-                        x.AddSagaStateMachines(entryAssembly);
-                        x.AddSagas(entryAssembly);
-                        x.AddActivities(entryAssembly);
+                        config.AddConsumers(entryAssembly);
+                        config.AddSagaStateMachines(entryAssembly);
+                        config.AddSagas(entryAssembly);
+                        config.AddActivities(entryAssembly);
 
-                        x.UsingRabbitMq((context, cfg) =>
+                        config.UsingRabbitMq((context, mqConfig) =>
                         {
-                            cfg.Host("localhost", "employees", h =>
+                            mqConfig.Host("localhost", "employees", h =>
                             {
                                 h.Username("guest");
                                 h.Password("guest");
                             });
 
-                            cfg.PrefetchCount = 2;
-                            cfg.UseMessageRetry(r => r.Interval(5, 1000));
-                            cfg.UseInMemoryOutbox();
+                            mqConfig.PrefetchCount = 2;
+                            mqConfig.UseMessageRetry(r => r.Interval(5, 1000));
+                            mqConfig.UseInMemoryOutbox();
 
-                            cfg.ConfigureEndpoints(context);
+                            mqConfig.ConfigureEndpoints(context);
                         });
+                    });
+
+                    services.AddOptions<MassTransitHostOptions>()
+                        .Configure(config =>
+                        {
+                            config.WaitUntilStarted = true;
+                        });
+
+                    services.AddOpenTelemetryTracing(builder =>
+                    {
+                        builder.SetResourceBuilder(ResourceBuilder.CreateDefault()
+                                .AddService("Publisher")
+                                .AddTelemetrySdk()
+                                .AddEnvironmentVariableDetector())
+                            .AddSource("MassTransit")
+                            .AddAspNetCoreInstrumentation()
+                            .AddJaegerExporter(o =>
+                            {
+                                o.AgentHost = "localhost";
+                                o.AgentPort = 6831;
+                                o.MaxPayloadSizeInBytes = 4096;
+                                o.ExportProcessorType = ExportProcessorType.Batch;
+                                o.BatchExportProcessorOptions = new BatchExportProcessorOptions<Activity>
+                                {
+                                    MaxQueueSize = 2048,
+                                    ScheduledDelayMilliseconds = 5000,
+                                    ExporterTimeoutMilliseconds = 30000,
+                                    MaxExportBatchSize = 512,
+                                };
+                            });
                     });
 
                     BrokerMapping.MapEntities();
